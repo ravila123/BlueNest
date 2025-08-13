@@ -249,7 +249,7 @@ today = __import__('datetime').date.today()
 st.markdown(f"## {APP_TITLE}")
 st.caption(today.strftime('%A, %B %d, %Y'))
 
-with st.expander("🤖 Ask BlueNest (try: *what's my fitness goal of the year?*)", expanded=False):
+with st.expander("🐶 Ask BlueNest", expanded=False):
     with SessionLocal() as s:
         us = s.query(User).order_by(User.name).all()
         uid_map = {u.name: u.id for u in us}
