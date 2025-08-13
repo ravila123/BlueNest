@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+.venv
+.DS_Store
+bluenest.db
+uploads/*
+!uploads/.gitkeep
+.vscode/
+Thumbs.db
