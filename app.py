@@ -1,12 +1,31 @@
+# app.py — BlueNest 💙 (Phase 1: no LLM; smarter on-device summarizer)
+# Layout per convo:
+# - Sidebar: Active user = Ravi | Amitha | Common
+# - Ravi/Amitha: Daily “notebook” (rich text), swipe-style prev/next (±7 days), calendar for others, Ask BlueNest (summarizer)
+# - Common: Wish List, Vision Board (blank board: text/image/video), Travel, Ask BlueNest (summarizer across both)
+# - Dark cozy UI, emoji badges for small polish
+#
+# NOTE: For rich text, install:  pip install "streamlit-quill>=0.1.0"
 
 import os
 import re
+import json
+import calendar
 import datetime as dt
-from typing import Optional, List, Dict
+from typing import Optional, Dict, List, Tuple
+
 import streamlit as st
 import pandas as pd
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, Date, Text, DateTime, ForeignKey
+from sqlalchemy import (
+    create_engine, Column, Integer, String, Boolean, Date, Text, DateTime, ForeignKey
+)
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
+
+# Rich text editor (optional, falls back to textarea if missing)
+try:
+    from streamlit_quill import st_quill
+except Exception:
+    st_quill = None
 
 APP_TITLE = "BlueNest 💙"
 DEFAULT_USERS = ["Ravi", "Amitha"]
@@ -27,7 +46,7 @@ class Task(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     title = Column(String, nullable=False)
-    scope = Column(String, nullable=False)  # daily/weekly/monthly/quarterly/half/year
+    scope = Column(String, nullable=False, default="daily")  # reserved for future (weekly/monthly/etc)
     due_date = Column(Date, nullable=True)  # used for daily
     completed = Column(Boolean, default=False)
     created_at = Column(DateTime, default=dt.datetime.utcnow)
@@ -45,12 +64,19 @@ class Wish(Base):
     user = relationship("User")
 
 class Board(Base):
+    """
+    Flexible blank board:
+      kind: 'text' | 'image' | 'video'
+      content: text content or video URL
+      media_path: local path for uploaded image/video file (optional)
+    """
     __tablename__ = "vision_board"
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    caption = Column(String, nullable=False)
-    image_path = Column(String, nullable=True)  # cached uploads
-    tag = Column(String, default="general")
+    kind = Column(String, default="text")
+    content = Column(Text, default="")
+    media_path = Column(String, nullable=True)
+    created_at = Column(DateTime, default=dt.datetime.utcnow)
     user = relationship("User")
 
 class Travel(Base):
@@ -63,14 +89,14 @@ class Travel(Base):
     notes = Column(Text, default="")
     user = relationship("User")
 
-class Food(Base):
-    __tablename__ = "food_list"
+class DailyNote(Base):
+    """Rich daily notebook (Quill delta JSON) per user per date"""
+    __tablename__ = "daily_notes"
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    dish = Column(String, nullable=False)
-    type = Column(String, default="Meal")  # Meal/Snack/Dessert/Drink
-    when = Column(String, default="Any")   # Any/Weeknight/Weekend/Date-Night
-    tried = Column(Boolean, default=False)
+    date = Column(Date, nullable=False)
+    content_json = Column(Text, default="{}")  # quill delta JSON string
+    updated_at = Column(DateTime, default=dt.datetime.utcnow)
     user = relationship("User")
 
 def init_db():
@@ -80,10 +106,7 @@ def init_db():
             for n in DEFAULT_USERS:
                 s.add(User(name=n))
             s.commit()
-
 init_db()
-
-SCOPES = ["daily", "weekly", "monthly", "quarterly", "half", "year"]
 
 # ---------- Helpers ----------
 def get_user_by_name(name: str) -> User:
@@ -94,28 +117,41 @@ def get_user_by_name(name: str) -> User:
             s.add(u); s.commit(); s.refresh(u)
         return u
 
-def auto_rollover_incomplete_daily(user_id: int):
-    today = dt.date.today()
-    with SessionLocal() as s:
-        stale = (
-            s.query(Task)
-            .filter(Task.user_id == user_id, Task.scope == "daily",
-                    Task.completed == False, Task.due_date != None, Task.due_date < today)
-            .all()
-        )
-        for t in stale: t.due_date = today
-        if stale: s.commit()
+def pick_emoji(text: str) -> str:
+    t = text.lower()
+    mapping = [
+        (r"\b(run|gym|workout|yoga|lift|walk|ride|swim|steps)\b","💪"),
+        (r"\b(call|phone)\b","📞"),
+        (r"\b(email|mail)\b","✉️"),
+        (r"\bbook|tickets|flight|hotel)\b","✈️"),
+        (r"\bmeet|meeting|sync|standup|review\b","🤝"),
+        (r"\bpay|bill|invoice\b","💳"),
+        (r"\bshop|buy|order\b","🛒"),
+        (r"\bcook|meal|lunch|dinner|breakfast\b","🍽️"),
+        (r"\bread\b","📚"),
+        (r"\bcode|bug|deploy|commit\b","💻"),
+        (r"\bclean|laundry|dish|trash\b","🧹"),
+        (r"\btravel|trip|itinerary\b","🧭"),
+    ]
+    for pat, emo in mapping:
+        if re.search(pat, t): return emo
+    return "🗒️"
 
-def add_task(user_id: int, title: str, scope: str, due: Optional[dt.date], notes: str):
+def get_or_create_daily_note(user_id: int, date: dt.date) -> DailyNote:
     with SessionLocal() as s:
-        s.add(Task(user_id=user_id, title=title.strip(), scope=scope, due_date=due, notes=notes.strip()))
-        s.commit()
+        note = s.query(DailyNote).filter(DailyNote.user_id==user_id, DailyNote.date==date).first()
+        if not note:
+            note = DailyNote(user_id=user_id, date=date, content_json=json.dumps({"ops":[{"insert":"\n"}]}))
+            s.add(note); s.commit(); s.refresh(note)
+        return note
 
-def toggle_task(task_id: int, value: bool):
+def save_daily_note(note_id: int, content: dict):
     with SessionLocal() as s:
-        t = s.query(Task).get(task_id)
-        if t:
-            t.completed = value; s.commit()
+        note = s.query(DailyNote).get(note_id)
+        if note:
+            note.content_json = json.dumps(content or {})
+            note.updated_at = dt.datetime.utcnow()
+            s.commit()
 
 def delete_row(model, row_id: int):
     with SessionLocal() as s:
@@ -123,83 +159,155 @@ def delete_row(model, row_id: int):
         if obj:
             s.delete(obj); s.commit()
 
-def pick_emoji(text: str, scope: str) -> str:
-    import re
-    t = text.lower()
-    scope_emoji = {"daily":"🗓️","weekly":"📆","monthly":"🗓️","quarterly":"📊","half":"🌓","year":"🎯"}.get(scope,"•")
-    mapping = [
-        (r"\b(run|gym|workout|yoga|lift|walk|ride|swim|steps)\b","💪"),
-        (r"\b(call|phone)\b","📞"),
-        (r"\b(email|mail)\b","✉️"),
-        (r"\bbook|tickets|flight|hotel\b","✈️"),
-        (r"\bmeet|meeting|sync|standup|review\b","🤝"),
-        (r"\bpay|bill|invoice\b","💳"),
-        (r"\bshop|buy|order\b","🛒"),
-        (r"\bcook|meal|lunch|dinner|breakfast\b","🍽️"),
-        (r"\bread\b","📚"),
-        (r"\bcode|bug|deploy|commit\b","🧑‍💻"),
-        (r"\bclean|laundry|dish|trash\b","🧹"),
-        (r"\btravel|trip|itinerary\b","🧭"),
-    ]
-    for pat, emo in mapping:
-        if re.search(pat, t): return emo
-    return scope_emoji
+def quill_delta_to_text(delta_json: str) -> str:
+    """Flatten Quill delta to plain text for summarization/search."""
+    try:
+        ops = json.loads(delta_json or "{}").get("ops", [])
+        return "".join(op.get("insert","") for op in ops)
+    except Exception:
+        return ""
 
-def board_summary_for_user(uid: int) -> str:
-    with SessionLocal() as s:
-        cards = s.query(Board).filter(Board.user_id==uid).all()
-        if not cards: return "No vision items yet."
-        tags = {}
-        for c in cards:
-            k = (c.tag or "general").strip().lower()
-            tags[k] = tags.get(k, 0) + 1
-        parts = [f"#{k}: {v}" for k,v in sorted(tags.items(), key=lambda x:-x[1])]
-        return " | ".join(parts)
+# --------- Date parsing for questions (no external libs) ----------
+WEEKDAYS = {name.lower(): i for i, name in enumerate(calendar.day_name)}  # monday=0..sunday=6
+MONTHS = {name.lower(): i+1 for i, name in enumerate(calendar.month_name) if name}
+MONTHS.update({name.lower(): i+1 for i, name in enumerate(calendar.month_abbr) if name})
 
-def answer_query(q: str, uid_map):
-    ql = q.lower().strip()
-    who = None
-    for name in uid_map:
+def parse_human_date(q: str, today: dt.date) -> Optional[dt.date]:
+    """Parse simple date phrases like 'April 10', 'Apr 10 2025', 'yesterday', 'last Tuesday', 'next Fri'."""
+    ql = q.lower()
+
+    # today / yesterday / tomorrow
+    if "today" in ql: return today
+    if "yesterday" in ql: return today - dt.timedelta(days=1)
+    if "tomorrow" in ql: return today + dt.timedelta(days=1)
+
+    # last/next weekday (limit search within 14 days)
+    m = re.search(r"\b(last|next)\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", ql)
+    if m:
+        direction, wd = m.group(1), m.group(2)
+        target = WEEKDAYS[wd]
+        delta = (target - today.weekday()) % 7
+        if direction == "next":
+            delta = 7 if delta == 0 else delta
+            return today + dt.timedelta(days=delta)
+        else:  # last
+            delta = 7 if delta == 0 else delta
+            return today - dt.timedelta(days=delta)
+
+    # explicit yyyy-mm-dd or mm/dd/yyyy
+    m = re.search(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b", ql)
+    if m:
+        y, mo, d = map(int, m.groups())
+        try: return dt.date(y, mo, d)
+        except: pass
+    m = re.search(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b", ql)
+    if m:
+        mo, d, y = map(int, m.groups())
+        try: return dt.date(y, mo, d)
+        except: pass
+
+    # "April 10", "Apr 10th", "10 April 2025"
+    # Month name first
+    m = re.search(r"\b([A-Za-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?(?:,\s*(\d{4}))?\b", q)
+    if m:
+        mon_name, day_str, year_str = m.groups()
+        mo = MONTHS.get(mon_name.lower())
+        if mo:
+            day = int(day_str)
+            year = int(year_str) if year_str else today.year
+            try: return dt.date(year, mo, day)
+            except: pass
+    # Day first
+    m = re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})(?:\s+(\d{4}))?\b", q)
+    if m:
+        day_str, mon_name, year_str = m.groups()
+        mo = MONTHS.get(mon_name.lower())
+        if mo:
+            day = int(day_str)
+            year = int(year_str) if year_str else today.year
+            try: return dt.date(year, mo, day)
+            except: pass
+
+    return None
+
+def detect_subject(q: str, default_user: str) -> Tuple[str, List[str]]:
+    """Return mode: 'single' or 'both', and target names list."""
+    ql = q.lower()
+    if " we " in f" {ql} " or " both " in f" {ql} " or "together" in ql:
+        return "both", DEFAULT_USERS
+    for name in DEFAULT_USERS:
         if name.lower() in ql:
-            who = name
-            break
-    if who is None:
-        who = list(uid_map.keys())[0]
-    uid = uid_map[who]
-    import re, datetime as dt
+            return "single", [name]
+    if "my " in ql or "me " in f"{ql} ":  # rough heuristic
+        return "single", [default_user]
+    return "single", [default_user]
+
+# --------- Summarizer (no LLM) ----------
+def summarize_day_for_users(date: dt.date, names: List[str]) -> str:
+    """Summarize daily notes + tasks for given date and users."""
+    lines = [f"### Summary for {date.strftime('%A, %B %d, %Y')}"]
     with SessionLocal() as s:
-        if "fitness" in ql:
-            fit = s.query(Task).filter(Task.user_id==uid, Task.scope.in_(["year","half","quarterly","monthly"])).all()
-            hits = [t for t in fit if re.search(r"run|gym|workout|yoga|lift|walk|swim|steps|marathon|cardio", (t.title + " " + (t.notes or "")).lower())]
-            if hits:
-                bullets = "\n".join([f"- {t.title}" for t in hits[:8]])
-                return f"{who}'s fitness-focused goals:\n{bullets}"
+        for nm in names:
+            u = s.query(User).filter(User.name==nm).first()
+            if not u:
+                lines.append(f"- {nm}: no profile found."); continue
+            # Note
+            dn = s.query(DailyNote).filter(DailyNote.user_id==u.id, DailyNote.date==date).first()
+            note_text = quill_delta_to_text(dn.content_json)[:800].strip() if dn else ""
+            # Tasks
+            tasks = s.query(Task).filter(Task.user_id==u.id, Task.scope=="daily", Task.due_date==date)\
+                                 .order_by(Task.completed.asc(), Task.created_at.desc()).all()
+            lines.append(f"**{nm}**")
+            if note_text:
+                lines.append(f"- Notebook: {note_text}")
             else:
-                return f"I couldn't find explicit fitness goals for {who}. Try adding some under Year/Monthly tabs."
-        if "travel" in ql or "trip" in ql:
-            trips = s.query(Travel).filter(Travel.user_id==uid).all()
-            if trips:
-                bullets = "\n".join([f"- {tr.place} ({tr.timeline}) — {tr.status}" for tr in trips[:10]])
-                return f"{who}'s travel plans:\n{bullets}"
+                lines.append("- Notebook: (empty)")
+            if tasks:
+                for t in tasks[:20]:
+                    lines.append(f"- [{'x' if t.completed else ' '}] {t.title}")
             else:
-                return f"No travel goals saved for {who} yet."
-        if "year goal" in ql or "yearly" in ql:
-            yg = s.query(Task).filter(Task.user_id==uid, Task.scope=="year").all()
-            if yg:
-                bullets = "\n".join([f"- {t.title}" for t in yg[:12]])
-                return f"{who}'s year goals:\n{bullets}"
+                lines.append("- Tasks: (none)")
+    return "\n".join(lines)
+
+def ask_bluenest_summarizer(question: str, default_user: str) -> str:
+    """Answers date-based questions and simple summaries from stored data (no external LLM)."""
+    today = dt.date.today()
+    mode, targets = detect_subject(question, default_user)
+    d = parse_human_date(question, today)
+
+    if d:
+        # Single day summary
+        if mode == "both":
+            return summarize_day_for_users(d, DEFAULT_USERS)
+        else:
+            return summarize_day_for_users(d, targets)
+    # If no date matched, try lightweight intents
+    ql = question.lower()
+    with SessionLocal() as s:
+        if "today" in ql or "now" in ql:
+            d = today
+            if mode == "both":
+                return summarize_day_for_users(d, DEFAULT_USERS)
             else:
-                return f"No year goals for {who} yet."
-        today = dt.date.today()
-        d = s.query(Task).filter(Task.user_id==uid, Task.scope=="daily", Task.due_date==today).all()
-        if d:
-            bullets = "\n".join([f"- {t.title} ({'Done' if t.completed else 'Pending'})" for t in d[:12]])
-            return f"Today's tasks for {who}:\n{bullets}"
-        return "Ask me about fitness goals, travel, or year goals — or include a name like 'Ravi' or 'Amitha'."
+                return summarize_day_for_users(d, targets)
+        if "yesterday" in ql:
+            d = today - dt.timedelta(days=1)
+            if mode == "both":
+                return summarize_day_for_users(d, DEFAULT_USERS)
+            else:
+                return summarize_day_for_users(d, targets)
+
+    # Fallback: explain how to ask
+    return ("I can summarize a specific day for you. Try:\n"
+            "- “what did I do on April 10?”\n"
+            "- “what did we do on April 11th?”\n"
+            "- “what did Amitha do yesterday?”\n"
+            "- “what did Ravi do last Tuesday?”")
 
 # ---------- UI ----------
 st.set_page_config(page_title="BlueNest", page_icon="💙", layout="wide")
 
+# Cozy dark background
 st.markdown("""
 <style>
 html, body, [data-testid="stAppViewContainer"] {
@@ -218,12 +326,16 @@ h1, h2, h3 { letter-spacing: .3px; }
 .tag { font-size:.78rem; padding:.12rem .5rem; border-radius:999px; border:1px solid rgba(56,189,248,.35); }
 .title-row { display:flex; align-items:center; gap:.6rem; }
 .title-heart { font-size:1.6rem; line-height:1; }
+.sidebar-section-title { font-size:.9rem; opacity:.8; margin-top:.5rem; }
 </style>
 """, unsafe_allow_html=True)
 
+# Sidebar: Active User + Section nav
 with st.sidebar:
     st.markdown("### <div class='title-row'><span class='title-heart'>💙</span><span>BlueNest</span></div>", unsafe_allow_html=True)
     st.caption("A cozy, shared planner for Ravi & Amitha.")
+
+    # ensure users exist
     with SessionLocal() as s:
         user_names = [u.name for u in s.query(User).order_by(User.name).all()]
     for required in DEFAULT_USERS:
@@ -231,116 +343,140 @@ with st.sidebar:
             get_user_by_name(required)
     with SessionLocal() as s:
         user_names = [u.name for u in s.query(User).order_by(User.name).all()]
-    current_user_name = st.selectbox("Active User", options=user_names, index=user_names.index("Ravi") if "Ravi" in user_names else 0)
-    current_user = get_user_by_name(current_user_name)
 
-    st.markdown("---")
-    st.write("**Quick Add (Daily To‑Do)**")
-    q_title = st.text_input("Title", key="qa_title", placeholder="E.g., Book tickets, Prep lunch, Gym session")
-    if st.button("Add to Today's List ➕", use_container_width=True):
-        if q_title.strip():
-            add_task(current_user.id, f"{pick_emoji(q_title, 'daily')} {q_title}", "daily", __import__('datetime').date.today(), "")
-            st.success("Added!")
-            st.rerun()
+    persona = st.radio("Active user", options=["Ravi","Amitha","Common"], index=0 if "Ravi" in user_names else 2, horizontal=True)
+    if persona != "Common":
+        current_user = get_user_by_name(persona)
+        st.markdown("<div class='sidebar-section-title'>Personal</div>", unsafe_allow_html=True)
+        section = st.radio("Section", ["Dashboard","Daily","Ask BlueNest"], index=1)
+    else:
+        current_user = None
+        st.markdown("<div class='sidebar-section-title'>Common</div>", unsafe_allow_html=True)
+        section = st.radio("Section", ["Dashboard","Wish List","Vision Board","Travel","Ask BlueNest"], index=1)
 
-auto_rollover_incomplete_daily(current_user.id)
-
-today = __import__('datetime').date.today()
+today = dt.date.today()
 st.markdown(f"## {APP_TITLE}")
 st.caption(today.strftime('%A, %B %d, %Y'))
 
-with st.expander("🐶 Ask BlueNest", expanded=False):
+# Dashboard (simple summary)
+def render_dashboard(user_name: Optional[str]):
     with SessionLocal() as s:
-        us = s.query(User).order_by(User.name).all()
-        uid_map = {u.name: u.id for u in us}
-    q = st.text_input("Ask a question about your goals, tasks, travel, or vision board")
-    if q:
-        ans = answer_query(q, uid_map)
-        st.text(ans)
+        if user_name:
+            u = s.query(User).filter(User.name==user_name).first()
+            if u:
+                # Daily tasks quick stats
+                total_today = s.query(Task).filter(Task.user_id==u.id, Task.scope=="daily", Task.due_date==today).count()
+                done_today = s.query(Task).filter(Task.user_id==u.id, Task.scope=="daily", Task.due_date==today, Task.completed==True).count()
+                pct = int((done_today/total_today)*100) if total_today else 0
+                st.markdown(
+                    f'<div class="bubble"><b>Hi, {user_name}!</b> '
+                    f'You’ve completed <b>{done_today}</b> of <b>{total_today}</b> today — <b>{pct}%</b>.</div>',
+                    unsafe_allow_html=True
+                )
+        else:
+            # Common dashboard: quick wish/travel counts
+            wish_open = s.query(Wish).filter(Wish.acquired==False).count()
+            trip_planned = s.query(Travel).filter(Travel.status!="Done").count()
+            st.markdown(
+                f'<div class="bubble">Shared snapshot — open wishes: <b>{wish_open}</b>, upcoming trips: <b>{trip_planned}</b>.</div>',
+                unsafe_allow_html=True
+            )
 
-tabs = st.tabs([
-    "Dashboard", "Daily", "Weekly", "Monthly", "Quarterly", "Half-Year", "Year",
-    "Wish List", "Vision Board", "Travel", "Food", "Summary", "Settings"
-])
+# Daily notebook page (rich text, swipe prev/next ±7 days, calendar for others)
+def render_daily(user: User):
+    st.markdown("### Daily Notebook")
 
-def task_list_ui(scope: str):
-    st.markdown(f"#### {scope.capitalize()} Planner")
-    due = None
-    if scope == "daily":
-        due = st.date_input("For date", value=__import__('datetime').date.today(), key=f"date_{scope}")
-    title = st.text_input("Add a task", key=f"title_{scope}", placeholder="Describe the task…")
-    notes = st.text_area("Notes (optional)", key=f"notes_{scope}", placeholder="Any details…", height=80)
-    if st.button(f"Add {scope.capitalize()} Task", key=f"add_{scope}"):
-        if title.strip():
-            title_with_emoji = f"{pick_emoji(title, scope)} {title}"
-            add_task(current_user.id, title_with_emoji, scope, due, notes)
-            st.success("Task added.")
+    # state date
+    key = f"daily_date_{user.id}"
+    if key not in st.session_state:
+        st.session_state[key] = today
+
+    # toolbar: prev/next limited ±7 days from today, plus calendar
+    d: dt.date = st.session_state[key]
+    colA, colB, colC, colD = st.columns([0.1,0.3,0.3,0.3])
+    with colA:
+        st.write("")  # spacing
+        can_prev = (today - d).days <= 0 and (d - (today - dt.timedelta(days=7))).days > 0
+        if st.button("←", disabled=not can_prev):
+            st.session_state[key] = d - dt.timedelta(days=1)
+            st.rerun()
+    with colB:
+        st.markdown(f"**{d.strftime('%A, %B %d, %Y')}**")
+    with colC:
+        pick = st.date_input("Go to date", value=d, label_visibility="collapsed")
+        if pick != d:
+            st.session_state[key] = pick
+            st.rerun()
+    with colD:
+        can_next = (d - today).days < 0 and (today - d).days <= 7
+        if st.button("→", disabled=not can_next):
+            st.session_state[key] = d + dt.timedelta(days=1)
             st.rerun()
 
+    note = get_or_create_daily_note(user.id, st.session_state[key])
+    st.write("")  # spacer
+
+    st.markdown("**Notebook**")
+    if st_quill is None:
+        st.warning("Install the rich text editor: `pip install streamlit-quill`")
+        raw = st.text_area("Notes", value=quill_delta_to_text(note.content_json), placeholder="Start typing… (bold, bullets etc. available when streamlit-quill is installed)")
+        if st.button("Save"):
+            save_daily_note(note.id, {"ops":[{"insert": raw + "\n"}]})
+            st.success("Saved."); st.rerun()
+    else:
+        try:
+            content_dict = json.loads(note.content_json or "{}")
+        except Exception:
+            content_dict = {"ops":[{"insert":"\n"}]}
+        result = st_quill(value=content_dict, placeholder="Type here • • •", key=f"quill_{note.id}", html=False, toolbar=True)
+        if st.button("Save"):
+            save_daily_note(note.id, result or {"ops":[{"insert":"\n"}]})
+            st.success("Saved."); st.rerun()
+
+    st.markdown("---")
+    st.markdown("**Optional quick to-dos for this day**")
+    t_title = st.text_input("Add a to-do", key=f"todo_title_{user.id}", placeholder="Describe the task…")
+    if st.button("Add to-do", key=f"todo_add_{user.id}"):
+        if t_title.strip():
+            with SessionLocal() as s:
+                s.add(Task(user_id=user.id, title=f"{pick_emoji(t_title)} {t_title.strip()}", scope="daily", due_date=st.session_state[key]))
+                s.commit()
+            st.success("Task added."); st.rerun()
+
     with SessionLocal() as s:
-        q = s.query(Task).filter(Task.user_id == current_user.id, Task.scope == scope)
-        if scope == "daily":
-            chosen_day = st.session_state.get(f"date_{scope}", __import__('datetime').date.today())
-            q = q.filter(Task.due_date == chosen_day)
-        tasks = q.order_by(Task.completed.asc(), Task.created_at.desc()).all()
+        tasks = s.query(Task).filter(Task.user_id==user.id, Task.scope=="daily", Task.due_date==st.session_state[key])\
+                             .order_by(Task.completed.asc(), Task.created_at.desc()).all()
+    if tasks:
+        for t in tasks:
+            c1,c2,c3 = st.columns([0.08, 0.74, 0.18])
+            with c1:
+                checked = st.checkbox("", value=t.completed, key=f"chk_{t.id}")
+                if checked != t.completed:
+                    with SessionLocal() as s:
+                        tt = s.query(Task).get(t.id); tt.completed = checked; s.commit()
+                    st.rerun()
+            with c2:
+                st.markdown(f"**{t.title}**")
+                if t.notes:
+                    st.caption(t.notes)
+            with c3:
+                if st.button("🗑️", key=f"del_{t.id}"):
+                    delete_row(Task, t.id); st.rerun()
+    else:
+        st.info("No to-dos yet — add one above ✨")
 
-    if not tasks:
-        st.info("No tasks yet — add one above ✨"); return
+# Ask BlueNest (Summarizer only; no LLM)
+def render_ask(user_name_opt: Optional[str]):
+    st.markdown("### 🤖 Ask BlueNest (Summarizer)")
+    q = st.text_input("Ask things like “what did I do on April 10?”, “what did we do on April 11th?”, “what did Amitha do last Tuesday?”")
+    if q:
+        default_user = user_name_opt or "Ravi"
+        ans = ask_bluenest_summarizer(q, default_user)
+        st.markdown(ans.replace("\n", "  \n"))
 
-    for t in tasks:
-        cols = st.columns([0.06, 0.74, 0.12, 0.08])
-        with cols[0]:
-            checked = st.checkbox("", value=t.completed, key=f"chk_{scope}_{t.id}")
-            if checked != t.completed:
-                toggle_task(t.id, checked); st.rerun()
-        with cols[1]:
-            label = f"**{t.title}**"
-            if t.notes: label += f"<br/><span style='font-size:.85rem;opacity:.8'>{t.notes}</span>"
-            if scope == "daily" and t.due_date:
-                label += f" &nbsp; <span class='tag'>📅 {t.due_date.strftime('%b %d')}</span>"
-            st.markdown(label, unsafe_allow_html=True)
-        with cols[2]:
-            st.markdown(f"<span class='tag'>{'✅ Done' if t.completed else '⏳ Pending'}</span>", unsafe_allow_html=True)
-        with cols[3]:
-            if st.button("🗑️", key=f"del_{scope}_{t.id}", help="Delete"):
-                delete_row(Task, t.id); st.rerun()
-
-# Dashboard
-with tabs[0]:
-    st.markdown("### Overview")
-    with SessionLocal() as s:
-        total_today = s.query(Task).filter(Task.user_id==current_user.id, Task.scope=="daily", Task.due_date==__import__('datetime').date.today()).count()
-        done_today = s.query(Task).filter(Task.user_id==current_user.id, Task.scope=="daily", Task.due_date==__import__('datetime').date.today(), Task.completed==True).count()
-        pct = int((done_today/total_today)*100) if total_today else 0
-        st.markdown(f'<div class="bubble"><b>Hi, {current_user.name}!</b> You’ve completed <b>{done_today}</b> of <b>{total_today}</b> today — <b>{pct}%</b>. Keep going! 💪</div>', unsafe_allow_html=True)
-
-        st.markdown("#### Vision Board Summary")
-        if s.query(Board).filter(Board.user_id==current_user.id).count():
-            st.markdown(f"<div class='bubble'>{board_summary_for_user(current_user.id)}</div>", unsafe_allow_html=True)
-        else:
-            st.info("No vision board items yet. Add a few under the Vision Board tab.")
-
-        st.markdown("#### This Week Snapshot")
-        week_end = __import__('datetime').date.today() + __import__('datetime').timedelta(days=6)
-        week_tasks = s.query(Task).filter(Task.user_id==current_user.id, Task.scope=="daily",
-                                          Task.due_date >= __import__('datetime').date.today(), Task.due_date <= week_end).all()
-        if week_tasks:
-            df = pd.DataFrame([{"Date": t.due_date, "Task": t.title, "Status": "Done" if t.completed else "Pending"} for t in week_tasks]).sort_values(["Date","Status"])
-            st.dataframe(df, use_container_width=True, hide_index=True)
-        else:
-            st.info("No daily tasks scheduled for the next 7 days.")
-
-# Scopes
-with tabs[1]: task_list_ui("daily")
-with tabs[2]: task_list_ui("weekly")
-with tabs[3]: task_list_ui("monthly")
-with tabs[4]: task_list_ui("quarterly")
-with tabs[5]: task_list_ui("half")
-with tabs[6]: task_list_ui("year")
-
-# Wish List
-with tabs[7]:
-    st.markdown("#### Wish List")
+# Common: Wish List
+def render_wish_list():
+    st.markdown("### Wish List (Common)")
     colA, colB, colC, colD = st.columns([0.38, 0.32, 0.18, 0.12])
     with colA: w_item = st.text_input("What do you want?", key="wish_item", placeholder="Noise-canceling headphones")
     with colB: w_link = st.text_input("Link (optional)", key="wish_link", placeholder="https://…")
@@ -350,12 +486,11 @@ with tabs[7]:
         if st.button("Add ➕", use_container_width=True, key="wish_add"):
             if w_item.strip():
                 with SessionLocal() as s:
-                    title = f"🎁 {w_item.strip()}"
-                    s.add(Wish(user_id=current_user.id, item=title, link=w_link.strip(), priority=w_pri)); s.commit()
+                    # store under Ravi by convention; Common view shows all
+                    s.add(Wish(user_id=get_user_by_name("Ravi").id, item=f"🎁 {w_item.strip()}", link=w_link.strip(), priority=w_pri)); s.commit()
                 st.success("Added to wish list."); st.rerun()
-
     with SessionLocal() as s:
-        wishes = s.query(Wish).filter(Wish.user_id==current_user.id).order_by(Wish.acquired.asc(), Wish.priority.desc()).all()
+        wishes = s.query(Wish).order_by(Wish.acquired.asc(), Wish.priority.desc()).all()
     if wishes:
         for w in wishes:
             cols = st.columns([0.06, 0.58, 0.24, 0.12])
@@ -374,49 +509,71 @@ with tabs[7]:
                 if st.button("🗑️", key=f"wish_del_{w.id}"): delete_row(Wish, w.id); st.rerun()
     else: st.info("Add your first wish ✨")
 
-# Vision Board
-with tabs[8]:
-    st.markdown("#### Vision Board")
-    col1, col2 = st.columns([0.6, 0.4])
-    with col1:
-        v_caption = st.text_input("Caption", key="v_caption", placeholder="Run a half marathon")
-        v_tag = st.text_input("Tag", key="v_tag", placeholder="health, career, travel…")
-        v_img = st.file_uploader("Image (optional)", type=["png","jpg","jpeg","webp"], key="v_img")
-        if st.button("Add to Board ➕", key="v_add"):
-            img_path = None
-            if v_img:
+# Common: Vision Board (blank board — text / image / video blocks)
+def render_vision_board():
+    st.markdown("### Vision Board (Common)")
+    st.caption("Drop text, images, or videos. No forced captions/tags — just a cozy board.")
+
+    kind = st.radio("Add a block", ["Text","Image","Video"], horizontal=True)
+    if kind == "Text":
+        txt = st.text_area("Write something", placeholder="Type your thought…")
+        if st.button("Add ➕", key="vb_add_text"):
+            if txt.strip():
+                with SessionLocal() as s:
+                    s.add(Board(user_id=get_user_by_name("Ravi").id, kind="text", content=txt.strip())); s.commit()
+                st.success("Added."); st.rerun()
+    elif kind == "Image":
+        img = st.file_uploader("Upload an image", type=["png","jpg","jpeg","webp"], key="vb_img")
+        if st.button("Add ➕", key="vb_add_img"):
+            if img:
                 upload_dir = "uploads"; os.makedirs(upload_dir, exist_ok=True)
-                img_path = os.path.join(upload_dir, f"{__import__('time').time()}_{v_img.name}")
-                with open(img_path,"wb") as f: f.write(v_img.read())
+                path = os.path.join(upload_dir, f"{dt.datetime.utcnow().timestamp()}_{img.name}")
+                with open(path,"wb") as f: f.write(img.read())
+                with SessionLocal() as s:
+                    s.add(Board(user_id=get_user_by_name("Ravi").id, kind="image", content="", media_path=path)); s.commit()
+                st.success("Added."); st.rerun()
+    else:  # Video
+        url = st.text_input("YouTube/Video URL (or upload a video file below)")
+        vid = st.file_uploader("Upload a video file (optional)", type=["mp4","mov","m4v","webm"], key="vb_vid")
+        if st.button("Add ➕", key="vb_add_vid"):
+            media_path = None
+            if vid:
+                upload_dir = "uploads"; os.makedirs(upload_dir, exist_ok=True)
+                media_path = os.path.join(upload_dir, f"{dt.datetime.utcnow().timestamp()}_{vid.name}")
+                with open(media_path,"wb") as f: f.write(vid.read())
             with SessionLocal() as s:
-                s.add(Board(user_id=current_user.id, caption=f"🪄 {v_caption or 'Untitled'}", image_path=img_path, tag=v_tag or 'general')); s.commit()
-            st.success("Added to your board."); st.rerun()
-    with col2:
-        st.info("Tip: Tag your visions (e.g., health, career, travel) and filter below.")
+                s.add(Board(user_id=get_user_by_name("Ravi").id, kind="video", content=(url or ""), media_path=media_path)); s.commit()
+            st.success("Added."); st.rerun()
 
-    tag_filter = st.text_input("Filter by tag (optional)", key="v_filter")
+    # grid
     with SessionLocal() as s:
-        q = s.query(Board).filter(Board.user_id==current_user.id)
-        if tag_filter.strip(): q = q.filter(Board.tag.contains(tag_filter.strip()))
-        cards = q.order_by(Board.id.desc()).all()
-
+        cards = s.query(Board).order_by(Board.created_at.desc()).all()
     if cards:
         grid_cols = st.columns(3)
         for i, c in enumerate(cards):
             with grid_cols[i % 3]:
-                st.markdown(f"**{c.caption}**  \n<span class='tag'>#{c.tag}</span>", unsafe_allow_html=True)
-                if c.image_path and os.path.exists(c.image_path): st.image(c.image_path, use_column_width=True)
+                if c.kind == "text":
+                    st.markdown(f'<div class="bubble">{c.content}</div>', unsafe_allow_html=True)
+                elif c.kind == "image":
+                    if c.media_path and os.path.exists(c.media_path):
+                        st.image(c.media_path, use_column_width=True)
+                else:  # video
+                    if c.content and c.content.startswith("http"):
+                        st.video(c.content)
+                    elif c.media_path and os.path.exists(c.media_path):
+                        st.video(c.media_path)
                 if st.button("🗑️ Remove", key=f"vb_del_{c.id}"):
                     delete_row(Board, c.id)
-                    if c.image_path and os.path.exists(c.image_path):
-                        try: os.remove(c.image_path)
+                    if c.media_path and os.path.exists(c.media_path):
+                        try: os.remove(c.media_path)
                         except: pass
                     st.rerun()
-    else: st.info("Pin your first vision ✨")
+    else:
+        st.info("Your board is empty — add a block above.")
 
-# Travel
-with tabs[9]:
-    st.markdown("#### Travel Goals")
+# Common: Travel
+def render_travel():
+    st.markdown("### Travel (Common)")
     c1, c2, c3 = st.columns([0.4,0.3,0.3])
     with c1: place = st.text_input("Destination", key="t_place", placeholder="Kyoto")
     with c2: timeline = st.text_input("Target Timeline", key="t_time", placeholder="Oct 2025")
@@ -424,11 +581,11 @@ with tabs[9]:
     notes = st.text_area("Notes", key="t_notes", placeholder="Accommodation ideas, must-do spots…")
     if st.button("Add Trip ➕", key="t_add"):
         with SessionLocal() as s:
-            s.add(Travel(user_id=current_user.id, place=f"🧭 {place or 'Somewhere'}", timeline=timeline or "2025", status=status, notes=notes)); s.commit()
+            s.add(Travel(user_id=get_user_by_name("Ravi").id, place=f"🧭 {place or 'Somewhere'}", timeline=timeline or "2025", status=status, notes=notes)); s.commit()
         st.success("Trip added."); st.rerun()
 
     with SessionLocal() as s:
-        trips = s.query(Travel).filter(Travel.user_id==current_user.id).order_by(Travel.status.asc()).all()
+        trips = s.query(Travel).order_by(Travel.status.asc()).all()
     if trips:
         df = pd.DataFrame([{"Destination": tr.place, "Timeline": tr.timeline, "Status": tr.status, "Notes": tr.notes, "ID": tr.id} for tr in trips])
         st.dataframe(df.drop(columns=["ID"]), use_container_width=True, hide_index=True)
@@ -436,88 +593,24 @@ with tabs[9]:
         if del_id != "—": delete_row(Travel, int(del_id)); st.rerun()
     else: st.info("Add your first travel plan ✈️")
 
-# Food
-with tabs[10]:
-    st.markdown("#### Food List")
-    f1,f2,f3,f4 = st.columns([0.4,0.2,0.2,0.2])
-    with f1: dish = st.text_input("Dish/Item", key="f_dish", placeholder="Grilled chicken with quinoa")
-    with f2: ftype = st.selectbox("Type", ["Meal","Snack","Dessert","Drink"], key="f_type")
-    with f3: when = st.selectbox("When", ["Any","Weeknight","Weekend","Date-Night"], key="f_when")
-    with f4:
-        st.write("")
-        if st.button("Add ➕", use_container_width=True, key="f_add"):
-            with SessionLocal() as s:
-                s.add(Food(user_id=current_user.id, dish=f"🍽️ {dish or 'Untitled'}", type=ftype, when=when)); s.commit()
-            st.success("Added."); st.rerun()
-
-    with SessionLocal() as s:
-        foods = s.query(Food).filter(Food.user_id==current_user.id).order_by(Food.tried.asc(), Food.type.asc()).all()
-    if foods:
-        for fd in foods:
-            cols = st.columns([0.06, 0.54, 0.22, 0.18])
-            with cols[0]:
-                tried = st.checkbox("", value=fd.tried, key=f"food_chk_{fd.id}")
-                if tried != fd.tried:
-                    with SessionLocal() as s:
-                        fupd = s.query(Food).get(fd.id); fupd.tried = tried; s.commit()
-                    st.rerun()
-            with cols[1]: st.markdown(f"**{fd.dish}**", unsafe_allow_html=True)
-            with cols[2]: st.markdown(f"<span class='tag'>{fd.type}</span>", unsafe_allow_html=True)
-            with cols[3]:
-                st.markdown(f"<span class='tag'>{fd.when}</span>", unsafe_allow_html=True)
-                if st.button("🗑️", key=f"food_del_{fd.id}"): delete_row(Food, fd.id); st.rerun()
-    else: st.info("Start your food ideas 🍽️")
-
-# Summary (both users)
-with tabs[11]:
-    st.markdown("#### Shared Summary")
-    with SessionLocal() as s:
-        us = s.query(User).order_by(User.name).all()
-        names = [u.name for u in us]; uid = {u.name: u.id for u in us}
-        rows = []
-        for nm in names:
-            tid = uid[nm]
-            total_t = s.query(Task).filter(Task.user_id==tid, Task.scope=="daily", Task.due_date==__import__('datetime').date.today()).count()
-            done_t = s.query(Task).filter(Task.user_id==tid, Task.scope=="daily", Task.due_date==__import__('datetime').date.today(), Task.completed==True).count()
-            pct = int((done_t/total_t)*100) if total_t else 0
-            rows.append({"User": nm, "Today's Done": done_t, "Today's Total": total_t, "Progress %": pct})
-        st.markdown("**Today at a glance**")
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-        st.markdown("**Year Goals (open)**")
-        yg = s.query(Task).filter(Task.scope=="year", Task.completed==False).all()
-        if yg:
-            df = pd.DataFrame([{"User": s.query(User).get(t.user_id).name, "Goal": t.title, "Notes": (t.notes or "")[:120]} for t in yg])
-            st.dataframe(df, use_container_width=True, hide_index=True)
-        else: st.info("No open year goals yet.")
-
-        st.markdown("**Wish List — High Priority**")
-        highs = s.query(Wish).filter(Wish.priority=="High", Wish.acquired==False).all()
-        if highs:
-            dfh = pd.DataFrame([{"User": s.query(User).get(w.user_id).name, "Item": w.item, "Link": w.link if (w.link and w.link.startswith('http')) else ""} for w in highs])
-            st.dataframe(dfh, use_container_width=True, hide_index=True)
-        else: st.info("No high-priority wishes pending.")
-
-# Settings
-with tabs[12]:
-    st.markdown("#### Settings")
-    st.markdown("Manage people so both of you show up in the dropdown:")
-    with SessionLocal() as s: existing = [u.name for u in s.query(User).order_by(User.name).all()]
-    colA, colB = st.columns(2)
-    with colA:
-        new_name = st.text_input("Add a user", placeholder="Type a name…")
-        if st.button("Add User", key="user_add"):
-            if new_name.strip() and new_name.strip() not in existing:
-                with SessionLocal() as s: s.add(User(name=new_name.strip())); s.commit()
-                st.success("User added."); st.rerun()
-    with colB:
-        rename_from = st.selectbox("Rename existing", options=existing)
-        rename_to = st.text_input("New name")
-        if st.button("Rename", key="user_rename"):
-            with SessionLocal() as s:
-                u = s.query(User).filter(User.name==rename_from).first()
-                if u and rename_to.strip():
-                    u.name = rename_to.strip(); s.commit()
-            st.success("Renamed."); st.rerun()
-
-    st.caption("Storage: SQLite `bluenest.db` next to the app; uploads in `uploads/`.")
+# ----- Router -----
+if persona != "Common":
+    # Ravi or Amitha
+    if section == "Dashboard":
+        render_dashboard(persona)
+    elif section == "Daily":
+        render_daily(current_user)
+    elif section == "Ask BlueNest":
+        render_ask(persona)
+else:
+    # Common
+    if section == "Dashboard":
+        render_dashboard(None)
+    elif section == "Wish List":
+        render_wish_list()
+    elif section == "Vision Board":
+        render_vision_board()
+    elif section == "Travel":
+        render_travel()
+    elif section == "Ask BlueNest":
+        render_ask(None)
