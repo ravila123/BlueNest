@@ -1,11 +1,11 @@
-# app.py — BlueNest 💙 (Phase 1: no LLM; smarter on-device summarizer)
-# Layout per convo:
+# app.py — BlueNest 💙 (Phase 1: minimal To-Do focus, notebook on right, floating "Ask Blue" chat)
 # - Sidebar: Active user = Ravi | Amitha | Common
-# - Ravi/Amitha: Daily “notebook” (rich text), swipe-style prev/next (±7 days), calendar for others, Ask BlueNest (summarizer)
-# - Common: Wish List, Vision Board (blank board: text/image/video), Travel, Ask BlueNest (summarizer across both)
-# - Dark cozy UI, emoji badges for small polish
+# - Main: Minimal, aesthetic To-Do (type + Enter to add). Date header with prev/next (±7 days) & calendar.
+# - Right panel: Daily Notebook (rich text if streamlit-quill is installed; else textarea)
+# - Floating 🐶 "Ask Blue" button top-right opens a small chat square (summarizer; no LLM)
+# - Common: Wish List, Vision Board (text/image/video), Travel
 #
-# NOTE: For rich text, install:  pip install "streamlit-quill>=0.1.0"
+# Optional editor: pip install "streamlit-quill==0.0.3"  (fallback to textarea if unavailable)
 
 import os
 import re
@@ -21,7 +21,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 
-# Rich text editor (optional, falls back to textarea if missing)
+# Optional rich editor
 try:
     from streamlit_quill import st_quill
 except Exception:
@@ -46,7 +46,7 @@ class Task(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     title = Column(String, nullable=False)
-    scope = Column(String, nullable=False, default="daily")  # reserved for future (weekly/monthly/etc)
+    scope = Column(String, nullable=False, default="daily")  # reserved for future scopes
     due_date = Column(Date, nullable=True)  # used for daily
     completed = Column(Boolean, default=False)
     created_at = Column(DateTime, default=dt.datetime.utcnow)
@@ -64,17 +64,12 @@ class Wish(Base):
     user = relationship("User")
 
 class Board(Base):
-    """
-    Flexible blank board:
-      kind: 'text' | 'image' | 'video'
-      content: text content or video URL
-      media_path: local path for uploaded image/video file (optional)
-    """
+    """Blank board blocks: text / image / video"""
     __tablename__ = "vision_board"
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    kind = Column(String, default="text")
-    content = Column(Text, default="")
+    kind = Column(String, default="text")   # 'text' | 'image' | 'video'
+    content = Column(Text, default="")      # text or video URL
     media_path = Column(String, nullable=True)
     created_at = Column(DateTime, default=dt.datetime.utcnow)
     user = relationship("User")
@@ -90,7 +85,7 @@ class Travel(Base):
     user = relationship("User")
 
 class DailyNote(Base):
-    """Rich daily notebook (Quill delta JSON) per user per date"""
+    """Daily notebook (Quill delta JSON) per user per date"""
     __tablename__ = "daily_notes"
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
@@ -117,13 +112,26 @@ def get_user_by_name(name: str) -> User:
             s.add(u); s.commit(); s.refresh(u)
         return u
 
+def delete_row(model, row_id: int):
+    with SessionLocal() as s:
+        obj = s.query(model).get(row_id)
+        if obj:
+            s.delete(obj); s.commit()
+
+def quill_delta_to_text(delta_json: str) -> str:
+    try:
+        ops = json.loads(delta_json or "{}").get("ops", [])
+        return "".join(op.get("insert","") for op in ops)
+    except Exception:
+        return ""
+
 def pick_emoji(text: str) -> str:
     t = text.lower()
     mapping = [
         (r"\b(run|gym|workout|yoga|lift|walk|ride|swim|steps)\b","💪"),
         (r"\b(call|phone)\b","📞"),
         (r"\b(email|mail)\b","✉️"),
-        (r"\bbook|tickets|flight|hotel)\b","✈️"),
+        (r"\bbook|tickets|flight|hotel\b","✈️"),
         (r"\bmeet|meeting|sync|standup|review\b","🤝"),
         (r"\bpay|bill|invoice\b","💳"),
         (r"\bshop|buy|order\b","🛒"),
@@ -135,7 +143,7 @@ def pick_emoji(text: str) -> str:
     ]
     for pat, emo in mapping:
         if re.search(pat, t): return emo
-    return "🗒️"
+    return "•"
 
 def get_or_create_daily_note(user_id: int, date: dt.date) -> DailyNote:
     with SessionLocal() as s:
@@ -153,35 +161,18 @@ def save_daily_note(note_id: int, content: dict):
             note.updated_at = dt.datetime.utcnow()
             s.commit()
 
-def delete_row(model, row_id: int):
-    with SessionLocal() as s:
-        obj = s.query(model).get(row_id)
-        if obj:
-            s.delete(obj); s.commit()
-
-def quill_delta_to_text(delta_json: str) -> str:
-    """Flatten Quill delta to plain text for summarization/search."""
-    try:
-        ops = json.loads(delta_json or "{}").get("ops", [])
-        return "".join(op.get("insert","") for op in ops)
-    except Exception:
-        return ""
-
-# --------- Date parsing for questions (no external libs) ----------
+# --------- Summarizer (no LLM) ----------
 WEEKDAYS = {name.lower(): i for i, name in enumerate(calendar.day_name)}  # monday=0..sunday=6
 MONTHS = {name.lower(): i+1 for i, name in enumerate(calendar.month_name) if name}
 MONTHS.update({name.lower(): i+1 for i, name in enumerate(calendar.month_abbr) if name})
 
 def parse_human_date(q: str, today: dt.date) -> Optional[dt.date]:
-    """Parse simple date phrases like 'April 10', 'Apr 10 2025', 'yesterday', 'last Tuesday', 'next Fri'."""
     ql = q.lower()
 
-    # today / yesterday / tomorrow
     if "today" in ql: return today
     if "yesterday" in ql: return today - dt.timedelta(days=1)
     if "tomorrow" in ql: return today + dt.timedelta(days=1)
 
-    # last/next weekday (limit search within 14 days)
     m = re.search(r"\b(last|next)\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", ql)
     if m:
         direction, wd = m.group(1), m.group(2)
@@ -190,11 +181,10 @@ def parse_human_date(q: str, today: dt.date) -> Optional[dt.date]:
         if direction == "next":
             delta = 7 if delta == 0 else delta
             return today + dt.timedelta(days=delta)
-        else:  # last
+        else:
             delta = 7 if delta == 0 else delta
             return today - dt.timedelta(days=delta)
 
-    # explicit yyyy-mm-dd or mm/dd/yyyy
     m = re.search(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b", ql)
     if m:
         y, mo, d = map(int, m.groups())
@@ -206,8 +196,6 @@ def parse_human_date(q: str, today: dt.date) -> Optional[dt.date]:
         try: return dt.date(y, mo, d)
         except: pass
 
-    # "April 10", "Apr 10th", "10 April 2025"
-    # Month name first
     m = re.search(r"\b([A-Za-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?(?:,\s*(\d{4}))?\b", q)
     if m:
         mon_name, day_str, year_str = m.groups()
@@ -217,7 +205,7 @@ def parse_human_date(q: str, today: dt.date) -> Optional[dt.date]:
             year = int(year_str) if year_str else today.year
             try: return dt.date(year, mo, day)
             except: pass
-    # Day first
+
     m = re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})(?:\s+(\d{4}))?\b", q)
     if m:
         day_str, mon_name, year_str = m.groups()
@@ -231,83 +219,59 @@ def parse_human_date(q: str, today: dt.date) -> Optional[dt.date]:
     return None
 
 def detect_subject(q: str, default_user: str) -> Tuple[str, List[str]]:
-    """Return mode: 'single' or 'both', and target names list."""
     ql = q.lower()
     if " we " in f" {ql} " or " both " in f" {ql} " or "together" in ql:
         return "both", DEFAULT_USERS
     for name in DEFAULT_USERS:
         if name.lower() in ql:
             return "single", [name]
-    if "my " in ql or "me " in f"{ql} ":  # rough heuristic
+    if " my " in f" {ql} " or ql.startswith("what did i"):
         return "single", [default_user]
     return "single", [default_user]
 
-# --------- Summarizer (no LLM) ----------
 def summarize_day_for_users(date: dt.date, names: List[str]) -> str:
-    """Summarize daily notes + tasks for given date and users."""
-    lines = [f"### Summary for {date.strftime('%A, %B %d, %Y')}"]
+    lines = [f"### {date.strftime('%A, %B %d, %Y')}"]
     with SessionLocal() as s:
         for nm in names:
             u = s.query(User).filter(User.name==nm).first()
             if not u:
                 lines.append(f"- {nm}: no profile found."); continue
-            # Note
             dn = s.query(DailyNote).filter(DailyNote.user_id==u.id, DailyNote.date==date).first()
             note_text = quill_delta_to_text(dn.content_json)[:800].strip() if dn else ""
-            # Tasks
             tasks = s.query(Task).filter(Task.user_id==u.id, Task.scope=="daily", Task.due_date==date)\
                                  .order_by(Task.completed.asc(), Task.created_at.desc()).all()
             lines.append(f"**{nm}**")
-            if note_text:
-                lines.append(f"- Notebook: {note_text}")
-            else:
-                lines.append("- Notebook: (empty)")
+            lines.append(f"- 📝 {note_text if note_text else '(no note)'}")
             if tasks:
                 for t in tasks[:20]:
-                    lines.append(f"- [{'x' if t.completed else ' '}] {t.title}")
+                    lines.append(f"- {'✅' if t.completed else '•'} {t.title}")
             else:
-                lines.append("- Tasks: (none)")
-    return "\n".join(lines)
+                lines.append("- (no tasks)")
+            lines.append("")  # spacer
+    return "\n".join(lines).strip()
 
 def ask_bluenest_summarizer(question: str, default_user: str) -> str:
-    """Answers date-based questions and simple summaries from stored data (no external LLM)."""
     today = dt.date.today()
     mode, targets = detect_subject(question, default_user)
     d = parse_human_date(question, today)
 
     if d:
-        # Single day summary
         if mode == "both":
             return summarize_day_for_users(d, DEFAULT_USERS)
         else:
             return summarize_day_for_users(d, targets)
-    # If no date matched, try lightweight intents
-    ql = question.lower()
-    with SessionLocal() as s:
-        if "today" in ql or "now" in ql:
-            d = today
-            if mode == "both":
-                return summarize_day_for_users(d, DEFAULT_USERS)
-            else:
-                return summarize_day_for_users(d, targets)
-        if "yesterday" in ql:
-            d = today - dt.timedelta(days=1)
-            if mode == "both":
-                return summarize_day_for_users(d, DEFAULT_USERS)
-            else:
-                return summarize_day_for_users(d, targets)
 
-    # Fallback: explain how to ask
-    return ("I can summarize a specific day for you. Try:\n"
+    # gentle help
+    return ("Try things like:\n"
             "- “what did I do on April 10?”\n"
-            "- “what did we do on April 11th?”\n"
-            "- “what did Amitha do yesterday?”\n"
-            "- “what did Ravi do last Tuesday?”")
+            "- “what did we do yesterday?”\n"
+            "- “what did Amitha do last Tuesday?”\n"
+            "- “what did Ravi do 2025-04-07?”")
 
 # ---------- UI ----------
 st.set_page_config(page_title="BlueNest", page_icon="💙", layout="wide")
 
-# Cozy dark background
+# Cozy ultra-minimal dark background & floating chat styles
 st.markdown("""
 <style>
 html, body, [data-testid="stAppViewContainer"] {
@@ -315,25 +279,44 @@ html, body, [data-testid="stAppViewContainer"] {
               radial-gradient(1200px 600px at 90% 20%, rgba(56,189,248,.06), transparent 60%),
               linear-gradient(180deg, #0b1220 0%, #0b1220 100%);
 }
-.block-container { padding-top: 1rem; padding-bottom: 3rem; }
+.block-container { padding-top: 1.2rem; padding-bottom: 2.4rem; }
 h1, h2, h3 { letter-spacing: .3px; }
-.bubble {
+.minibox {
   background: rgba(17,24,39,.65);
   border: 1px solid rgba(56,189,248,.25);
   border-radius: 14px; padding: 12px 14px; margin-bottom: 12px;
   box-shadow: 0 8px 22px rgba(2,132,199,.08);
 }
-.tag { font-size:.78rem; padding:.12rem .5rem; border-radius:999px; border:1px solid rgba(56,189,248,.35); }
-.title-row { display:flex; align-items:center; gap:.6rem; }
-.title-heart { font-size:1.6rem; line-height:1; }
-.sidebar-section-title { font-size:.9rem; opacity:.8; margin-top:.5rem; }
+.todo-input input {
+  background: rgba(255,255,255,0.06) !important;
+  border: 1px solid rgba(56,189,248,.25) !important;
+  border-radius: 12px !important;
+  height: 44px; font-size: 1rem;
+}
+.todo-item {
+  display:flex; align-items:center; gap:.6rem;
+  padding:.5rem .6rem; border-radius: 10px;
+  border:1px solid rgba(56,189,248,.15);
+  background: rgba(17,24,39,.45);
+  margin-bottom:.4rem;
+}
+.todo-date {
+  font-size:.9rem; opacity:.85; letter-spacing:.2px;
+}
+#blue-fab { position: fixed; top: 14px; right: 16px; z-index: 9999; }
+#blue-fab button { border-radius: 999px; width: 42px; height: 42px; font-size: 22px; }
+#blue-chat {
+  position: fixed; top: 64px; right: 16px; width: 300px; z-index: 9999;
+  background: rgba(17,24,39,.90); border:1px solid rgba(56,189,248,.35); border-radius: 14px; padding: 10px;
+  box-shadow: 0 12px 32px rgba(2,132,199,.25);
+}
 </style>
 """, unsafe_allow_html=True)
 
-# Sidebar: Active User + Section nav
+# Sidebar
 with st.sidebar:
-    st.markdown("### <div class='title-row'><span class='title-heart'>💙</span><span>BlueNest</span></div>", unsafe_allow_html=True)
-    st.caption("A cozy, shared planner for Ravi & Amitha.")
+    st.markdown("### BlueNest 💙")
+    st.caption("Minimal daily to-dos for Ravi & Amitha.")
 
     # ensure users exist
     with SessionLocal() as s:
@@ -345,82 +328,105 @@ with st.sidebar:
         user_names = [u.name for u in s.query(User).order_by(User.name).all()]
 
     persona = st.radio("Active user", options=["Ravi","Amitha","Common"], index=0 if "Ravi" in user_names else 2, horizontal=True)
-    if persona != "Common":
-        current_user = get_user_by_name(persona)
-        st.markdown("<div class='sidebar-section-title'>Personal</div>", unsafe_allow_html=True)
-        section = st.radio("Section", ["Dashboard","Daily","Ask BlueNest"], index=1)
+
+    if persona == "Common":
+        section = st.radio("Section", ["Wish List","Vision Board","Travel"], index=0)
     else:
-        current_user = None
-        st.markdown("<div class='sidebar-section-title'>Common</div>", unsafe_allow_html=True)
-        section = st.radio("Section", ["Dashboard","Wish List","Vision Board","Travel","Ask BlueNest"], index=1)
+        section = "To-Do"
 
 today = dt.date.today()
 st.markdown(f"## {APP_TITLE}")
 st.caption(today.strftime('%A, %B %d, %Y'))
 
-# Dashboard (simple summary)
-def render_dashboard(user_name: Optional[str]):
-    with SessionLocal() as s:
-        if user_name:
-            u = s.query(User).filter(User.name==user_name).first()
-            if u:
-                # Daily tasks quick stats
-                total_today = s.query(Task).filter(Task.user_id==u.id, Task.scope=="daily", Task.due_date==today).count()
-                done_today = s.query(Task).filter(Task.user_id==u.id, Task.scope=="daily", Task.due_date==today, Task.completed==True).count()
-                pct = int((done_today/total_today)*100) if total_today else 0
-                st.markdown(
-                    f'<div class="bubble"><b>Hi, {user_name}!</b> '
-                    f'You’ve completed <b>{done_today}</b> of <b>{total_today}</b> today — <b>{pct}%</b>.</div>',
-                    unsafe_allow_html=True
-                )
-        else:
-            # Common dashboard: quick wish/travel counts
-            wish_open = s.query(Wish).filter(Wish.acquired==False).count()
-            trip_planned = s.query(Travel).filter(Travel.status!="Done").count()
-            st.markdown(
-                f'<div class="bubble">Shared snapshot — open wishes: <b>{wish_open}</b>, upcoming trips: <b>{trip_planned}</b>.</div>',
-                unsafe_allow_html=True
-            )
+# Floating 🐶 Ask Blue
+if "show_blue" not in st.session_state: st.session_state.show_blue = False
+st.markdown("<div id='blue-fab'>", unsafe_allow_html=True)
+if st.button("🐶", key="blueboy_toggle", help="Ask Blue"):
+    st.session_state.show_blue = not st.session_state.show_blue
+st.markdown("</div>", unsafe_allow_html=True)
 
-# Daily notebook page (rich text, swipe prev/next ±7 days, calendar for others)
-def render_daily(user: User):
-    st.markdown("### Daily Notebook")
+if st.session_state.show_blue:
+    st.markdown("<div id='blue-chat'>", unsafe_allow_html=True)
+    st.markdown("**Hey! It's Blue boy!!**  \n*What do you want to know from me?*")
+    q = st.text_input("Ask about a date", key="blue_q", label_visibility="collapsed", placeholder="e.g., what did we do on April 11?")
+    if q:
+        default_user = "Ravi" if persona not in DEFAULT_USERS else persona
+        ans = ask_bluenest_summarizer(q, default_user)
+        st.markdown(ans.replace("\n","  \n"))
+    if st.button("Close", key="blue_close", use_container_width=True):
+        st.session_state.show_blue = False
+        st.experimental_rerun() if hasattr(st, "experimental_rerun") else st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    # state date
-    key = f"daily_date_{user.id}"
-    if key not in st.session_state:
-        st.session_state[key] = today
+# ---------- Pages ----------
+def render_minimal_todo(user_name: str):
+    user = get_user_by_name(user_name)
 
-    # toolbar: prev/next limited ±7 days from today, plus calendar
-    d: dt.date = st.session_state[key]
-    colA, colB, colC, colD = st.columns([0.1,0.3,0.3,0.3])
-    with colA:
-        st.write("")  # spacing
+    # date state + controls
+    key_date = f"todo_date_{user.id}"
+    if key_date not in st.session_state:
+        st.session_state[key_date] = today
+
+    d: dt.date = st.session_state[key_date]
+
+    c_top = st.columns([0.15, 0.45, 0.40])
+    with c_top[0]:
         can_prev = (today - d).days <= 0 and (d - (today - dt.timedelta(days=7))).days > 0
-        if st.button("←", disabled=not can_prev):
-            st.session_state[key] = d - dt.timedelta(days=1)
+        if st.button("←", disabled=not can_prev, key=f"prev_{user.id}"):
+            st.session_state[key_date] = d - dt.timedelta(days=1)
             st.rerun()
-    with colB:
-        st.markdown(f"**{d.strftime('%A, %B %d, %Y')}**")
-    with colC:
-        pick = st.date_input("Go to date", value=d, label_visibility="collapsed")
+    with c_top[1]:
+        st.markdown(f"<div class='todo-date'><b>{d.strftime('%A, %B %d')}</b></div>", unsafe_allow_html=True)
+    with c_top[2]:
+        pick = st.date_input("Pick date", value=d, label_visibility="collapsed", key=f"pick_{user.id}")
         if pick != d:
-            st.session_state[key] = pick
-            st.rerun()
-    with colD:
-        can_next = (d - today).days < 0 and (today - d).days <= 7
-        if st.button("→", disabled=not can_next):
-            st.session_state[key] = d + dt.timedelta(days=1)
+            st.session_state[key_date] = pick
             st.rerun()
 
-    note = get_or_create_daily_note(user.id, st.session_state[key])
-    st.write("")  # spacer
+    # To-Do input (Enter to add)
+    st.markdown("<div class='todo-input'>", unsafe_allow_html=True)
+    key_input = f"new_task_{user.id}"
+    def _add_on_enter():
+        title = (st.session_state.get(key_input) or "").strip()
+        if title:
+            with SessionLocal() as s:
+                s.add(Task(user_id=user.id, title=f"{pick_emoji(title)} {title}", scope="daily", due_date=st.session_state[key_date]))
+                s.commit()
+            st.session_state[key_input] = ""
+            st.rerun()
+    st.text_input("Add a task", key=key_input, placeholder="Type and press Enter…", on_change=_add_on_enter, label_visibility="collapsed")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("**Notebook**")
+    # Tasks list
+    with SessionLocal() as s:
+        tasks = s.query(Task).filter(Task.user_id==user.id, Task.scope=="daily", Task.due_date==st.session_state[key_date])\
+                             .order_by(Task.completed.asc(), Task.created_at.desc()).all()
+    if not tasks:
+        st.markdown("<div class='minibox'>No tasks yet — add one above ✨</div>", unsafe_allow_html=True)
+    else:
+        for t in tasks:
+            st.markdown("<div class='todo-item'>", unsafe_allow_html=True)
+            col1, col2, col3 = st.columns([0.08, 0.76, 0.16])
+            with col1:
+                checked = st.checkbox("", value=t.completed, key=f"chk_{t.id}")
+                if checked != t.completed:
+                    with SessionLocal() as s:
+                        tt = s.query(Task).get(t.id); tt.completed = checked; s.commit()
+                    st.rerun()
+            with col2:
+                st.markdown(f"**{t.title}**")
+            with col3:
+                if st.button("🗑️", key=f"del_{t.id}"):
+                    delete_row(Task, t.id); st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    # Right panel notebook
+    st.markdown("---")
+    st.markdown("#### Notebook (for this day)")
+    note = get_or_create_daily_note(user.id, st.session_state[key_date])
     if st_quill is None:
-        st.warning("Install the rich text editor: `pip install streamlit-quill`")
-        raw = st.text_area("Notes", value=quill_delta_to_text(note.content_json), placeholder="Start typing… (bold, bullets etc. available when streamlit-quill is installed)")
-        if st.button("Save"):
+        raw = st.text_area("Notes", value=quill_delta_to_text(note.content_json), placeholder="Quick thoughts… (install streamlit-quill for rich editing)")
+        if st.button("Save note", key=f"save_note_{user.id}"):
             save_daily_note(note.id, {"ops":[{"insert": raw + "\n"}]})
             st.success("Saved."); st.rerun()
     else:
@@ -428,53 +434,11 @@ def render_daily(user: User):
             content_dict = json.loads(note.content_json or "{}")
         except Exception:
             content_dict = {"ops":[{"insert":"\n"}]}
-        result = st_quill(value=content_dict, placeholder="Type here • • •", key=f"quill_{note.id}", html=False, toolbar=True)
-        if st.button("Save"):
+        result = st_quill(value=content_dict, placeholder="Write freely…", key=f"quill_{note.id}", html=False, toolbar=True)
+        if st.button("Save note", key=f"save_quill_{user.id}"):
             save_daily_note(note.id, result or {"ops":[{"insert":"\n"}]})
             st.success("Saved."); st.rerun()
 
-    st.markdown("---")
-    st.markdown("**Optional quick to-dos for this day**")
-    t_title = st.text_input("Add a to-do", key=f"todo_title_{user.id}", placeholder="Describe the task…")
-    if st.button("Add to-do", key=f"todo_add_{user.id}"):
-        if t_title.strip():
-            with SessionLocal() as s:
-                s.add(Task(user_id=user.id, title=f"{pick_emoji(t_title)} {t_title.strip()}", scope="daily", due_date=st.session_state[key]))
-                s.commit()
-            st.success("Task added."); st.rerun()
-
-    with SessionLocal() as s:
-        tasks = s.query(Task).filter(Task.user_id==user.id, Task.scope=="daily", Task.due_date==st.session_state[key])\
-                             .order_by(Task.completed.asc(), Task.created_at.desc()).all()
-    if tasks:
-        for t in tasks:
-            c1,c2,c3 = st.columns([0.08, 0.74, 0.18])
-            with c1:
-                checked = st.checkbox("", value=t.completed, key=f"chk_{t.id}")
-                if checked != t.completed:
-                    with SessionLocal() as s:
-                        tt = s.query(Task).get(t.id); tt.completed = checked; s.commit()
-                    st.rerun()
-            with c2:
-                st.markdown(f"**{t.title}**")
-                if t.notes:
-                    st.caption(t.notes)
-            with c3:
-                if st.button("🗑️", key=f"del_{t.id}"):
-                    delete_row(Task, t.id); st.rerun()
-    else:
-        st.info("No to-dos yet — add one above ✨")
-
-# Ask BlueNest (Summarizer only; no LLM)
-def render_ask(user_name_opt: Optional[str]):
-    st.markdown("### 🤖 Ask BlueNest (Summarizer)")
-    q = st.text_input("Ask things like “what did I do on April 10?”, “what did we do on April 11th?”, “what did Amitha do last Tuesday?”")
-    if q:
-        default_user = user_name_opt or "Ravi"
-        ans = ask_bluenest_summarizer(q, default_user)
-        st.markdown(ans.replace("\n", "  \n"))
-
-# Common: Wish List
 def render_wish_list():
     st.markdown("### Wish List (Common)")
     colA, colB, colC, colD = st.columns([0.38, 0.32, 0.18, 0.12])
@@ -486,7 +450,6 @@ def render_wish_list():
         if st.button("Add ➕", use_container_width=True, key="wish_add"):
             if w_item.strip():
                 with SessionLocal() as s:
-                    # store under Ravi by convention; Common view shows all
                     s.add(Wish(user_id=get_user_by_name("Ravi").id, item=f"🎁 {w_item.strip()}", link=w_link.strip(), priority=w_pri)); s.commit()
                 st.success("Added to wish list."); st.rerun()
     with SessionLocal() as s:
@@ -509,10 +472,9 @@ def render_wish_list():
                 if st.button("🗑️", key=f"wish_del_{w.id}"): delete_row(Wish, w.id); st.rerun()
     else: st.info("Add your first wish ✨")
 
-# Common: Vision Board (blank board — text / image / video blocks)
 def render_vision_board():
     st.markdown("### Vision Board (Common)")
-    st.caption("Drop text, images, or videos. No forced captions/tags — just a cozy board.")
+    st.caption("Drop text, images, or videos — no forced captions or tags.")
 
     kind = st.radio("Add a block", ["Text","Image","Video"], horizontal=True)
     if kind == "Text":
@@ -532,8 +494,8 @@ def render_vision_board():
                 with SessionLocal() as s:
                     s.add(Board(user_id=get_user_by_name("Ravi").id, kind="image", content="", media_path=path)); s.commit()
                 st.success("Added."); st.rerun()
-    else:  # Video
-        url = st.text_input("YouTube/Video URL (or upload a video file below)")
+    else:
+        url = st.text_input("YouTube/Video URL (or upload a video)", key="vb_url")
         vid = st.file_uploader("Upload a video file (optional)", type=["mp4","mov","m4v","webm"], key="vb_vid")
         if st.button("Add ➕", key="vb_add_vid"):
             media_path = None
@@ -545,7 +507,6 @@ def render_vision_board():
                 s.add(Board(user_id=get_user_by_name("Ravi").id, kind="video", content=(url or ""), media_path=media_path)); s.commit()
             st.success("Added."); st.rerun()
 
-    # grid
     with SessionLocal() as s:
         cards = s.query(Board).order_by(Board.created_at.desc()).all()
     if cards:
@@ -553,15 +514,12 @@ def render_vision_board():
         for i, c in enumerate(cards):
             with grid_cols[i % 3]:
                 if c.kind == "text":
-                    st.markdown(f'<div class="bubble">{c.content}</div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="minibox">{c.content}</div>', unsafe_allow_html=True)
                 elif c.kind == "image":
-                    if c.media_path and os.path.exists(c.media_path):
-                        st.image(c.media_path, use_column_width=True)
-                else:  # video
-                    if c.content and c.content.startswith("http"):
-                        st.video(c.content)
-                    elif c.media_path and os.path.exists(c.media_path):
-                        st.video(c.media_path)
+                    if c.media_path and os.path.exists(c.media_path): st.image(c.media_path, use_column_width=True)
+                else:
+                    if c.content and c.content.startswith("http"): st.video(c.content)
+                    elif c.media_path and os.path.exists(c.media_path): st.video(c.media_path)
                 if st.button("🗑️ Remove", key=f"vb_del_{c.id}"):
                     delete_row(Board, c.id)
                     if c.media_path and os.path.exists(c.media_path):
@@ -571,7 +529,6 @@ def render_vision_board():
     else:
         st.info("Your board is empty — add a block above.")
 
-# Common: Travel
 def render_travel():
     st.markdown("### Travel (Common)")
     c1, c2, c3 = st.columns([0.4,0.3,0.3])
@@ -588,29 +545,19 @@ def render_travel():
         trips = s.query(Travel).order_by(Travel.status.asc()).all()
     if trips:
         df = pd.DataFrame([{"Destination": tr.place, "Timeline": tr.timeline, "Status": tr.status, "Notes": tr.notes, "ID": tr.id} for tr in trips])
-        st.dataframe(df.drop(columns=["ID"]), use_container_width=True, hide_index=True)
+        st.dataframe(df.drop(columns=["ID"]), use_column_width=True, hide_index=True)
         del_id = st.selectbox("Remove a trip (optional)", options=["—"] + [str(tr.id) for tr in trips], key="t_del")
         if del_id != "—": delete_row(Travel, int(del_id)); st.rerun()
     else: st.info("Add your first travel plan ✈️")
 
-# ----- Router -----
-if persona != "Common":
-    # Ravi or Amitha
-    if section == "Dashboard":
-        render_dashboard(persona)
-    elif section == "Daily":
-        render_daily(current_user)
-    elif section == "Ask BlueNest":
-        render_ask(persona)
-else:
-    # Common
-    if section == "Dashboard":
-        render_dashboard(None)
-    elif section == "Wish List":
+# ---------- Router ----------
+if persona == "Common":
+    if section == "Wish List":
         render_wish_list()
     elif section == "Vision Board":
         render_vision_board()
     elif section == "Travel":
         render_travel()
-    elif section == "Ask BlueNest":
-        render_ask(None)
+else:
+    # Minimal To-Do + Notebook (for Ravi or Amitha)
+    render_minimal_todo(persona)
