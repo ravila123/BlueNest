@@ -3,3 +3,4 @@ sqlalchemy>=2.0.0
 pandas>=2.0.0
 streamlit-quill==0.0.3
 python-dateutil>=2.9.0
+pytest>=7.0.0
