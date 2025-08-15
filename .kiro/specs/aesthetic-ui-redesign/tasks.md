@@ -52,7 +52,7 @@
   - Write tests for rollover logic and edge cases
   - _Requirements: 2.4_
 
-- [ ] 7. Create Vision Board canvas with media support
+- [-] 7. Create Vision Board canvas with media support
   - Implement VisionBoardItem CRUD operations with position tracking
   - Build drag-and-drop interface for images, videos, and text
   - Create inline media display with proper scaling and positioning
@@ -62,7 +62,7 @@
   - Write tests for media upload, positioning, and display functionality
   - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 4.6_
 
-- [-] 8. Implement Ask Blue floating chat interface
+- [x] 8. Implement Ask Blue floating chat interface
   - Create floating dog icon (🐶) component in top-right corner
   - Build small chat window that opens on icon click (not full-screen)
   - Implement greeting message: "Hey! It's Blue Boy!! What do you want to know from me?"
